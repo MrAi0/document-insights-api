@@ -1,0 +1,85 @@
+# docker compose up --build
+#
+# Compose sets the Mongo/Redis hostnames itself. Anything else can be
+# overridden in a .env file (see .env.example).
+#
+# Host ports default to 8000/27017/6379. If those are taken, override them:
+#   API_PORT=8080 REDIS_PORT=16379 docker compose up
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  image: document-insights-api
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    MONGO_URL: mongodb://mongo:27017
+    REDIS_URL: redis://redis:6379/0
+  depends_on:
+    mongo:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+
+  mongo:
+    image: mongo:7.0
+    volumes:
+      - mongo-data:/data/db
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Not started by `docker compose up`. Run with: docker compose run --rm tests
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      TEST_MONGO_URL: mongodb://mongo:27017
+      TEST_REDIS_URL: redis://redis:6379/15
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mongo-data:

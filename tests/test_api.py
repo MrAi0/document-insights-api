@@ -1,0 +1,154 @@
+from bson import ObjectId
+
+from app.utils.hashing import hash_content
+
+
+async def test_submit_document_is_queued(client, submit, redis):
+    resp = await submit()
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert body["summary"] is None
+    assert resp.headers["location"] == f"/documents/{body['document_id']}"
+    assert resp.headers["x-request-id"]
+
+    resp = await client.get(f"/documents/{body['document_id']}")
+    assert resp.status_code == 200
+    doc = resp.json()
+    assert doc["status"] == "queued"
+    assert doc["user_id"] == "alice"
+    assert doc["attempts"] == 0
+    assert "content" not in doc
+    # and a sleeping worker has been told about it
+    assert await redis.lrange("jobs:wakeup", 0, -1) == [body["document_id"]]
+
+
+async def test_submit_rejects_invalid_payload(client):
+    resp = await client.post("/documents", json={"user_id": "alice", "title": " ", "content": "x"})
+    assert resp.status_code == 422
+
+
+async def test_get_document_404s(client):
+    assert (await client.get(f"/documents/{ObjectId()}")).status_code == 404
+    # malformed ids are a 404 too, not a 500
+    assert (await client.get("/documents/not-an-object-id")).status_code == 404
+
+
+async def test_fourth_active_document_is_rejected(client, submit, processor):
+    for _ in range(3):
+        assert (await submit()).status_code == 201
+
+    resp = await submit()
+    assert resp.status_code == 429
+
+    # other users aren't affected
+    assert (await submit(user_id="bob")).status_code == 201
+
+    # once one of alice's documents finishes she can submit again
+    await processor.run_once()
+    assert (await submit()).status_code == 201
+
+
+async def test_duplicate_content_is_served_from_cache(client, submit, processor, redis):
+    content = "The quarterly numbers look good. Costs are down."
+    first = (await submit(content=content)).json()
+    await processor.run_once()
+    original = (await client.get(f"/documents/{first['document_id']}")).json()
+    assert original["status"] == "completed"
+    assert original["cache_hit"] is False
+
+    resp = await submit(user_id="bob", content=content)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert body["summary"] == original["summary"]
+    doc = (await client.get(f"/documents/{body['document_id']}")).json()
+    assert doc["cache_hit"] is True
+    # nothing to process, so no worker gets woken for it
+    assert await redis.lrange("jobs:wakeup", 0, -1) == [first["document_id"]]
+
+
+async def test_summary_is_reused_after_it_drops_out_of_redis(client, submit, processor, redis):
+    content = "Summarized a long time ago. Still the same text."
+    await submit(content=content)
+    await processor.run_once()
+    key = f"summary:{hash_content(content)}"
+    # what happens once the Redis TTL runs out
+    await redis.delete(key)
+
+    resp = await submit(user_id="bob", content=content)
+
+    # found in Mongo instead of being processed again
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "completed"
+    assert resp.json()["summary"] is not None
+    # and put back in Redis, with a fresh TTL, for the next request
+    assert await redis.ttl(key) > 0
+
+
+async def test_cache_hits_do_not_count_towards_the_limit(client, submit, processor):
+    content = "Already summarized."
+    await submit(user_id="bob", content=content)
+    await processor.run_once()
+
+    for _ in range(3):
+        await submit()
+    assert (await submit()).status_code == 429
+    # alice is at her limit but this one doesn't need processing
+    resp = await submit(content=content)
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "completed"
+
+
+async def test_list_documents_paginates_newest_first(client, submit, processor):
+    ids = []
+    for i in range(3):
+        ids.append((await submit(title=f"doc {i}")).json()["document_id"])
+        await processor.run_once()
+    await submit(user_id="bob")
+
+    resp = await client.get("/users/alice/documents", params={"page": 1, "page_size": 2})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3
+    assert [d["document_id"] for d in body["items"]] == [ids[2], ids[1]]
+
+    body = (await client.get("/users/alice/documents", params={"page": 2, "page_size": 2})).json()
+    assert [d["document_id"] for d in body["items"]] == [ids[0]]
+
+
+async def test_list_documents_filters_by_status(client, submit, processor):
+    await submit()
+    await processor.run_once()
+    await submit()
+
+    body = (await client.get("/users/alice/documents", params={"status": "queued"})).json()
+    assert body["total"] == 1
+    assert body["items"][0]["status"] == "queued"
+
+    body = (await client.get("/users/alice/documents", params={"status": "completed"})).json()
+    assert body["total"] == 1
+
+
+async def test_list_documents_validates_query(client):
+    assert (await client.get("/users/alice/documents", params={"page": 0})).status_code == 422
+    assert (
+        await client.get("/users/alice/documents", params={"page_size": 101})
+    ).status_code == 422
+    assert (
+        await client.get("/users/alice/documents", params={"status": "nope"})
+    ).status_code == 422
+
+
+async def test_list_documents_for_unknown_user_is_empty(client):
+    resp = await client.get("/users/nobody/documents")
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+
+
+async def test_health(client):
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "mongo": "ok", "redis": "ok"}
