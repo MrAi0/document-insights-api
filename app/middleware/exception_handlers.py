@@ -17,7 +17,8 @@ async def too_many_active_jobs(request: Request, exc: TooManyActiveJobs) -> JSON
 
 
 async def database_unavailable(request: Request, exc: ConnectionFailure) -> JSONResponse:
-    logger.error("database unavailable", exc_info=exc)
+    # no traceback, it's the same connection error on every request until Mongo is back
+    logger.error("database unavailable", extra={"error": str(exc)})
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": "Database unavailable, please retry shortly"},

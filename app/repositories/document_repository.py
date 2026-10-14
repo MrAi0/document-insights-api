@@ -1,3 +1,4 @@
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -6,12 +7,19 @@ from typing import Any
 from bson import ObjectId
 from pymongo import ASCENDING, DESCENDING, IndexModel, ReturnDocument
 from pymongo.asynchronous.database import AsyncDatabase
+from pymongo.errors import DuplicateKeyError
 
 from app.models import ACTIVE_STATUSES, DocumentStatus, Summary
 from app.utils.clock import utcnow
 
+logger = logging.getLogger(__name__)
+
 # list endpoints never need the full text
 _WITHOUT_CONTENT = {"content": 0}
+
+# A user has at most one document per content in these statuses. Failed ones
+# don't count, so content that failed can be submitted again.
+_NOT_FAILED = [*ACTIVE_STATUSES, DocumentStatus.COMPLETED]
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,22 @@ class DocumentRepository:
                 ),
             ]
         )
+        # find_submitted, and the unique constraint behind it: two identical
+        # requests racing each other can't both insert.
+        try:
+            await self._collection.create_index(
+                [("user_id", ASCENDING), ("content_hash", ASCENDING)],
+                name="user_content",
+                unique=True,
+                partialFilterExpression={"status": {"$in": _NOT_FAILED}},
+            )
+        except DuplicateKeyError:
+            # Duplicates saved before resubmissions returned the existing
+            # document. find_submitted still stops new ones, so keep going
+            # rather than refuse to start.
+            logger.warning(
+                "user_content index not created, a user already has the same content twice"
+            )
 
     async def create(
         self,
@@ -100,6 +124,16 @@ class DocumentRepository:
 
     async def get(self, document_id: ObjectId) -> dict[str, Any] | None:
         return await self._collection.find_one({"_id": document_id}, _WITHOUT_CONTENT)
+
+    async def find_submitted(self, user_id: str, content_hash: str) -> dict[str, Any] | None:
+        """The user's earlier document with the same content, unless it failed.
+
+        A single lookup on the user_content index. tests/test_indexes.py checks the plan.
+        """
+        return await self._collection.find_one(
+            {"user_id": user_id, "content_hash": content_hash, "status": {"$in": _NOT_FAILED}},
+            _WITHOUT_CONTENT,
+        )
 
     async def list_for_user(
         self, user_id: str, *, status: DocumentStatus | None, page: int, page_size: int

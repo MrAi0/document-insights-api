@@ -24,7 +24,7 @@ import logging
 import signal
 
 from pymongo.asynchronous.database import AsyncDatabase
-from pymongo.errors import PyMongoError
+from pymongo.errors import ConnectionFailure, PyMongoError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -61,8 +61,9 @@ class Worker:
         self._concurrency = concurrency
         self._max_idle_seconds = max_idle_seconds
         self._poll_interval_seconds = poll_interval_seconds
-        # Shared by all loops, so a Redis outage gets logged once, not once per loop.
+        # Shared by all loops, so an outage gets logged once, not once per loop.
         self._wakeups_working = True
+        self._mongo_working = True
 
     async def run(self) -> None:
         """Runs until cancelled."""
@@ -75,12 +76,17 @@ class Worker:
             try:
                 await self._process_ready_jobs()
                 sleep_for = await self._time_until_next_job()
-            except PyMongoError:
+            except PyMongoError as exc:
                 # If this hit a status write, the job's lease will run out and
                 # it gets picked up again, so nothing is lost.
-                logger.exception("mongo error in worker loop", extra={"slot": slot})
+                if isinstance(exc, ConnectionFailure):
+                    # Mongo is down. A traceback from every loop every few seconds says nothing new.
+                    self._set_mongo_working(False, exc)
+                else:
+                    logger.exception("mongo error in worker loop", extra={"slot": slot})
                 await asyncio.sleep(ERROR_BACKOFF_SECONDS)
                 continue
+            self._set_mongo_working(True)
             await self._sleep_until_woken(sleep_for)
 
     async def _process_ready_jobs(self) -> None:
@@ -109,6 +115,18 @@ class Worker:
             return
         self._set_wakeups_working(True)
         logger.debug("worker woke up", extra={"reason": "new document" if woken else "timeout"})
+
+    def _set_mongo_working(self, working: bool, error: Exception | None = None) -> None:
+        if working == self._mongo_working:
+            return
+        self._mongo_working = working
+        if working:
+            logger.info("mongo is back, processing jobs again")
+        else:
+            logger.error(
+                "mongo unavailable, retrying until it's back",
+                extra={"retry_every_seconds": ERROR_BACKOFF_SECONDS, "error": str(error)},
+            )
 
     def _set_wakeups_working(self, working: bool, error: Exception | None = None) -> None:
         if working == self._wakeups_working:

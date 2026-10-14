@@ -65,7 +65,7 @@ class CacheService:
 
         summary = await self._repository.find_summary(content_hash)
         if summary is not None:
-            logger.info(
+            logger.debug(
                 "summary found in mongo, cached again", extra={"content_hash": content_hash}
             )
             await self.set(content_hash, summary)

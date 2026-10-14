@@ -44,7 +44,7 @@ class DocumentCreate(BaseModel):
 class DocumentSubmitted(BaseModel):
     document_id: str
     status: DocumentStatus
-    # only set when the summary came straight from the cache
+    # only set when the document is already completed (from the cache, or sent before)
     summary: Summary | None = None
 
 

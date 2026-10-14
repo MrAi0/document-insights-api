@@ -1,3 +1,6 @@
+import asyncio
+
+import pytest
 from bson import ObjectId
 
 from app.utils.hashing import hash_content
@@ -100,6 +103,71 @@ async def test_cache_hits_do_not_count_towards_the_limit(client, submit, process
     resp = await submit(content=content)
     assert resp.status_code == 201
     assert resp.json()["status"] == "completed"
+
+
+async def test_resubmitting_the_same_content_returns_the_existing_document(
+    client, submit, processor, db, redis
+):
+    content = "Sent twice by the same user."
+    first = await submit(content=content)
+    assert first.status_code == 201
+    document_id = first.json()["document_id"]
+
+    # while it's still queued
+    again = await submit(content=content, title="Notes (again)")
+    assert again.status_code == 200
+    assert again.json() == first.json()
+    assert again.headers["location"] == f"/documents/{document_id}"
+
+    # and once it's done, now with the summary
+    await processor.run_once()
+    again = await submit(content=content)
+    assert again.status_code == 200
+    assert again.json()["document_id"] == document_id
+    assert again.json()["status"] == "completed"
+    assert again.json()["summary"] is not None
+
+    assert await db["documents"].count_documents({"user_id": "alice"}) == 1
+    # the original title is kept
+    assert (await client.get(f"/documents/{document_id}")).json()["title"] == "Notes"
+    # only the first submission woke a worker
+    assert await redis.lrange("jobs:wakeup", 0, -1) == [document_id]
+
+
+async def test_resubmitting_at_the_limit_returns_the_existing_document(client, submit):
+    first = (await submit(content="First of three.")).json()
+    for _ in range(2):
+        await submit()
+    assert (await submit()).status_code == 429
+
+    # not a new job, so the limit doesn't apply
+    resp = await submit(content="First of three.")
+    assert resp.status_code == 200
+    assert resp.json()["document_id"] == first["document_id"]
+
+
+@pytest.mark.parametrize("settings_overrides", [{"failure_rate": 1, "max_attempts": 1}])
+async def test_content_that_failed_can_be_submitted_again(client, submit, processor):
+    content = "Fails the first time."
+    first = (await submit(content=content)).json()
+    await processor.run_once()
+    assert (await client.get(f"/documents/{first['document_id']}")).json()["status"] == "failed"
+
+    resp = await submit(content=content)
+    assert resp.status_code == 201
+    assert resp.json()["document_id"] != first["document_id"]
+    assert resp.json()["status"] == "queued"
+
+
+async def test_identical_requests_at_the_same_time_create_one_document(submit, db, redis):
+    content = "Double clicked."
+    responses = await asyncio.gather(*(submit(content=content) for _ in range(3)))
+
+    assert len({r.json()["document_id"] for r in responses}) == 1
+    assert sorted(r.status_code for r in responses) == [200, 200, 201]
+    assert await db["documents"].count_documents({"user_id": "alice"}) == 1
+    # the requests that lost the race gave their rate limit slots back
+    assert await redis.zcard("active-jobs:alice") == 1
 
 
 async def test_list_documents_paginates_newest_first(client, submit, processor):

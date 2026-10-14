@@ -10,7 +10,7 @@ A backend service that accepts document text, summarizes it in the background an
 docker compose up --build
 ```
 
-This starts the API, a worker, MongoDB and Redis.
+This starts the API, a worker, MongoDB and Redis. Only the API and worker logs are shown; `docker compose logs mongo redis` has the rest.
 
 - API: http://localhost:8000
 - Swagger docs: http://localhost:8000/docs
@@ -50,6 +50,15 @@ uvicorn app.main:app --reload     # API
 python -m app.worker              # worker, in a second terminal
 ```
 
+**Postman:** `postman/` has a collection that tests every endpoint (happy path, resubmissions, cache hits, validation errors, rate limit) and a local environment. Import both into Postman and run the collection in the Collection Runner, or from the command line with the [Postman CLI](https://learning.postman.com/docs/postman-cli/postman-cli-installation/):
+
+```bash
+postman collection run postman/document-insights-api.postman_collection.json \
+  -e postman/local.postman_environment.json
+```
+
+A full run takes 20–100 seconds, most of it waiting for the worker to finish the submitted document. If the API isn't on port 8000, change `baseUrl` in the environment.
+
 ## Configuration
 
 All settings are environment variables, optionally set in a `.env` file. `.env.example` lists every one with a short description. The main ones:
@@ -62,13 +71,13 @@ All settings are environment variables, optionally set in a `.env` file. `.env.e
 | `MAX_ATTEMPTS` | 3 | tries per document before it's marked `failed` |
 | `PROCESSING_MIN_SECONDS` / `PROCESSING_MAX_SECONDS` | 10 / 30 | simulated processing time |
 | `FAILURE_RATE` | 0.1 | chance an attempt fails |
-| `LOG_JSON` | true | `false` for readable plain-text logs |
+| `LOG_JSON` | true | `false` for readable plain-text logs (compose uses `false` unless set) |
 
 ## API
 
 | Endpoint | Description | Status codes |
 |---|---|---|
-| `POST /documents` | Submit `user_id`, `title`, `content` | 201, 422 invalid input, 429 limit reached |
+| `POST /documents` | Submit `user_id`, `title`, `content` | 201, 200 already submitted (returns that document), 422 invalid input, 429 limit reached |
 | `GET /documents/{id}` | Status, plus the summary once completed | 200, 404 |
 | `GET /users/{user_id}/documents` | Paginated list, newest first. `page`, `page_size` (max 100), optional `status` | 200, 422 |
 | `GET /health` | Checks MongoDB and Redis | 200 `ok` or `degraded` (Redis down), 503 (Mongo down) |
@@ -116,6 +125,7 @@ app/
   config.py         settings from env vars
   models.py         Pydantic request/response models
 tests/
+postman/            Postman collection + local environment
 ```
 
 Controllers call services, and services call repositories or Redis. Services don't know about HTTP: they raise exceptions (e.g. `TooManyActiveJobs`) that the middleware turns into status codes, so the worker reuses the same services as the API. MongoDB and Redis clients are created once per process (`services/mongo_service.py`, `services/redis_service.py`), connected on startup and closed on shutdown.
@@ -147,9 +157,9 @@ For each job: claim it atomically → check the cache → summarize → save the
 - **No job is processed twice.** Claiming is a single atomic `find_one_and_update`, so two workers can't get the same job. A claimed job has a 60s lease: if the worker crashes, the job becomes available again. Every write checks the worker's `lease_token`, so a stale worker can't overwrite a newer result.
 - **Rate limiting** uses a Redis sorted set of each user's active document ids, updated by a Lua script so check-and-add is atomic. A set rather than a counter means a slot can't be freed twice, and slots left behind by a crash expire after an hour. Cache hits don't use a slot.
 - **The cache has two layers.** Redis keeps summaries for 24h, keyed by content hash. On a Redis miss, MongoDB is checked for any earlier completed document with the same hash. If one exists, its summary is reused and put back in Redis, so text that has been summarized once is never processed again. The cache is shared across users, since the summary depends only on the content.
-- **Duplicate submissions:** if the same text is submitted twice at the same time, a short lock on the content hash makes one job wait for the other's result instead of summarizing it again.
+- **Duplicate submissions:** a user sending text they already sent gets their existing document back (`200`, same `document_id`) instead of a new one. A unique index on `user_id + content_hash` (ignoring `failed` documents, so those can be retried) makes this hold even for two identical requests at the same moment. Different users sending the same text each get their own document, served from the cache. If they arrive at the same time, a short lock on the content hash makes one job wait for the other's result instead of summarizing it again.
 - **Redis down:** the API keeps working. The cache and rate limit read MongoDB instead, workers poll, and `/health` reports `degraded`. With **Mongo down** the API returns 503 and workers retry until it's back.
-- **Fast reads.** Every read is a direct index lookup: `content_hash` for finding an earlier summary, `user_id + created_at` and `user_id + status + created_at` for listing, `status + visible_at` for claiming jobs. With 100,000 documents, each read took under 1.5 ms (p95). `tests/test_indexes.py` checks MongoDB's query plans, so a missing index or a full collection scan fails the tests.
+- **Fast reads.** Every read is a direct index lookup: `content_hash` for finding an earlier summary, `user_id + content_hash` for a user's earlier submission, `user_id + created_at` and `user_id + status + created_at` for listing, `status + visible_at` for claiming jobs. With 100,000 documents, each read took under 1.5 ms (p95). `tests/test_indexes.py` checks MongoDB's query plans, so a missing index or a full collection scan fails the tests.
 - **Production basics:** JSON logs with a request id on every line, config validated at startup, graceful worker shutdown (a job in progress is put back in the queue), and the API and worker containers run as a non-root user.
 
 ## Assumptions

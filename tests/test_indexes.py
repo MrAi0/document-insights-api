@@ -12,6 +12,7 @@ import pytest
 from bson import ObjectId
 
 from app.models import DocumentStatus
+from app.repositories.document_repository import DocumentRepository
 from app.utils.clock import utcnow
 
 USERS = 10
@@ -32,7 +33,8 @@ async def profiled(db, repository):
                 "user_id": f"user{i % USERS}",
                 "title": "t",
                 "content": "x",
-                "content_hash": f"hash{i % 50}",
+                # 47 rather than 50 so no user has the same content twice (user_content is unique)
+                "content_hash": f"hash{i % 47}",
                 "status": status,
                 "summary": {
                     "text": "s",
@@ -90,6 +92,15 @@ async def test_summary_lookup_for_new_content_reads_nothing(profiled, repository
     assert entry["docsExamined"] == 0
 
 
+async def test_resubmission_lookup_reads_a_single_document(profiled, repository, db):
+    assert await repository.find_submitted("user3", "hash3") is not None
+
+    entry = await last_find(db)
+    assert_index_only(entry, "user_id: 1, content_hash: 1")
+    assert entry["keysExamined"] == 1
+    assert entry["docsExamined"] == 1
+
+
 @pytest.mark.parametrize("status", [None, DocumentStatus.COMPLETED])
 async def test_listing_reads_only_the_requested_page(profiled, repository, db, status):
     items, _ = await repository.list_for_user("user3", status=status, page=1, page_size=5)
@@ -106,3 +117,15 @@ async def test_finding_the_next_due_job_reads_a_single_document(profiled, reposi
     entry = await last_find(db)
     assert_index_only(entry, "visible_at")
     assert entry["docsExamined"] == 1
+
+
+async def test_startup_survives_duplicates_from_before_resubmissions_were_deduplicated(db):
+    docs = [{"user_id": "alice", "content_hash": "abc", "status": "completed"} for _ in range(2)]
+    await db["documents"].insert_many(docs)
+
+    await DocumentRepository(db).ensure_indexes()
+
+    indexes = await db["documents"].index_information()
+    assert "user_content" not in indexes
+    # the rest are still there
+    assert {"user_created", "user_status_created", "claim", "content_hash"} <= indexes.keys()

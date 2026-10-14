@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 # Anything else gets replaced; it ends up in every log line.
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
+# Docker's healthcheck hits this every few seconds. Only log it when it isn't healthy
+# (HealthService also logs which dependency failed).
+_HEALTH_PATH = "/health"
+
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """Tags every log line of a request with a request id, and writes one access log line."""
@@ -31,11 +35,15 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             response.headers["X-Request-ID"] = request_id
             return response
         finally:
-            logger.info(
-                "request",
+            path = request.url.path
+            quiet = path == _HEALTH_PATH and status_code == 200
+            logger.log(
+                logging.DEBUG if quiet else logging.INFO,
+                f"{request.method} {path}",
+                # also as fields, so JSON logs can be filtered and grouped by them
                 extra={
                     "method": request.method,
-                    "path": request.url.path,
+                    "path": path,
                     "status_code": status_code,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 1),
                 },

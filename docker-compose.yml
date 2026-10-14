@@ -5,6 +5,9 @@
 #
 # Host ports default to 8000/27017/6379. If those are taken, override them:
 #   API_PORT=8080 REDIS_PORT=16379 docker compose up
+#
+# `up` only streams the api and worker logs. Mongo logs every healthcheck
+# connection, so its output (and Redis') is under: docker compose logs mongo redis
 
 x-app: &app
   build:
@@ -17,6 +20,9 @@ x-app: &app
   environment:
     MONGO_URL: mongodb://mongo:27017
     REDIS_URL: redis://redis:6379/0
+    # Plain text here since these logs are read in a terminal. LOG_JSON=true (in
+    # .env or the shell) switches back to JSON, the default everywhere else.
+    LOG_JSON: ${LOG_JSON:-false}
   depends_on:
     mongo:
       condition: service_healthy
@@ -46,6 +52,7 @@ services:
 
   mongo:
     image: mongo:7.0
+    attach: false
     volumes:
       - mongo-data:/data/db
     ports:
@@ -58,6 +65,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    attach: false
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:

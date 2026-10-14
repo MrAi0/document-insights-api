@@ -1,6 +1,7 @@
 import logging
 
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from app.models import DocumentCreate, DocumentOut, DocumentPage, DocumentStatus
 from app.repositories.document_repository import DocumentRepository
@@ -34,11 +35,44 @@ class DocumentService:
         self._rate_limiter = rate_limiter
         self._wakeups = wakeups
 
-    async def submit(self, payload: DocumentCreate) -> DocumentOut:
+    async def submit(self, payload: DocumentCreate) -> tuple[DocumentOut, bool]:
+        """Returns the document, and whether it was created by this call.
+
+        A user sending content they already sent gets that document back rather
+        than a copy, unless it failed, in which case this is a fresh try. Other
+        users sending the same content still get documents of their own.
+        """
+        content_hash = hash_content(payload.content)
+        existing = await self._find_submitted(payload.user_id, content_hash)
+        if existing is not None:
+            return existing, False
+
+        try:
+            return await self._create(payload, content_hash), True
+        except DuplicateKeyError:
+            # An identical request inserted between our lookup and our insert
+            # (a double click, say). Return its document.
+            existing = await self._find_submitted(payload.user_id, content_hash)
+            if existing is None:
+                # Only if that document failed in the meantime. Rare enough
+                # to surface rather than loop.
+                raise
+            return existing, False
+
+    async def _find_submitted(self, user_id: str, content_hash: str) -> DocumentOut | None:
+        doc = await self._repository.find_submitted(user_id, content_hash)
+        if doc is None:
+            return None
+        logger.info(
+            "document already submitted, returning it",
+            extra={"document_id": str(doc["_id"]), "user_id": user_id},
+        )
+        return DocumentOut.from_mongo(doc)
+
+    async def _create(self, payload: DocumentCreate, content_hash: str) -> DocumentOut:
         # The id is generated here rather than by Mongo so the rate limit slot
         # can be reserved under it before the insert.
         document_id = ObjectId()
-        content_hash = hash_content(payload.content)
         log_extra = {"document_id": str(document_id), "user_id": payload.user_id}
 
         # Cache first. A cache hit never sits in the queue, so it shouldn't count

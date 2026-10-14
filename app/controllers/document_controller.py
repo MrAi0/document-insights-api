@@ -10,15 +10,22 @@ router = APIRouter(prefix="/documents", tags=["documents"])
     "",
     status_code=status.HTTP_201_CREATED,
     responses={
+        status.HTTP_200_OK: {
+            "model": DocumentSubmitted,
+            "description": "The user already submitted this content. Returns that document "
+            "instead of creating another",
+        },
         status.HTTP_429_TOO_MANY_REQUESTS: {
             "description": "The user already has the maximum number of documents in progress"
-        }
+        },
     },
 )
 async def submit_document(
     payload: DocumentCreate, response: Response, service: DocumentServiceDep
 ) -> DocumentSubmitted:
-    doc = await service.submit(payload)
+    doc, created = await service.submit(payload)
+    if not created:
+        response.status_code = status.HTTP_200_OK
     response.headers["Location"] = f"/documents/{doc.document_id}"
     return DocumentSubmitted(document_id=doc.document_id, status=doc.status, summary=doc.summary)
 

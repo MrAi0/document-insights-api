@@ -31,12 +31,14 @@ class JsonFormatter(logging.Formatter):
 class TextFormatter(logging.Formatter):
     """For local development. Same fields as the JSON output, as key=value pairs."""
 
+    default_msec_format = "%s.%03d"
+
     def __init__(self) -> None:
         super().__init__("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 
     def format(self, record: logging.LogRecord) -> str:
         line = super().format(record)
-        context = " ".join(f"{key}={value}" for key, value in _context(record).items())
+        context = " ".join(f"{key}={_text_value(value)}" for key, value in _context(record).items())
         if not context:
             return line
         # keep the traceback (if any) below the fields
@@ -44,14 +46,23 @@ class TextFormatter(logging.Formatter):
         return f"{first} {context}{sep}{rest}"
 
 
+def _text_value(value: object) -> str:
+    text = str(value)
+    # Quote values with spaces (mostly error messages) so the pairs stay readable,
+    # and with newlines so one record can't spill onto lines that look like others.
+    needs_quotes = not text or '"' in text or any(ch.isspace() for ch in text)
+    return json.dumps(text) if needs_quotes else text
+
+
 def _context(record: logging.LogRecord) -> dict:
     context = {}
-    request_id = request_id_var.get()
-    if request_id:
-        context["request_id"] = request_id
     for key, value in record.__dict__.items():
         if key not in _BUILTIN_ATTRS and not key.startswith("_"):
             context[key] = value
+    # last, so the fields specific to this line come first
+    request_id = request_id_var.get()
+    if request_id:
+        context["request_id"] = request_id
     return context
 
 
