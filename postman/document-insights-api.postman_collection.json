@@ -1,0 +1,1634 @@
+{
+  "info": {
+    "name": "Document Insights API",
+    "description": "Tests for the Document Insights API: submit document text, a worker summarizes it in the\nbackground (mocked, 10\u201330 s, ~10% failure rate), clients poll for the result.\nPolling `GET /documents/{id}` returns only `document_id` and `status` while the document is\n`queued` or `processing`, and the whole document once it's `completed` or `failed`.\n\n**Start the app first:** `docker compose up --build` from the repo root, then check\n`GET {{baseUrl}}/health`.\n\n**Run everything:** open the Collection Runner (or `postman collection run`) with the\n*Document Insights API - Local* environment. A full run takes ~15\u2013100 s, mostly waiting on the worker.\n\n**Variables**\n\n| Variable | Default | |\n|---|---|---|\n| `baseUrl` | `http://localhost:8000` | change if you set `API_PORT` |\n| `userId` | `alice` | user for the lifecycle folder |\n| `otherUserId` | `bob` | second user, who gets the same content from the cache |\n| `maxActiveJobs` | `3` | must match `MAX_ACTIVE_JOBS_PER_USER` |\n| `pollIntervalMs` | `3000` | delay between polls |\n| `maxPolls` | `60` | give up polling after this many tries |\n\nOther variables (`documentId`, `docContent`, ...) are set by scripts during a run.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Applies to every request.",
+          "pm.test('Response is JSON', () => pm.response.to.have.header('Content-Type', 'application/json'));",
+          "pm.test('Response carries an X-Request-ID', () => pm.response.to.have.header('X-Request-ID'));"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000"
+    },
+    {
+      "key": "userId",
+      "value": "alice"
+    },
+    {
+      "key": "otherUserId",
+      "value": "bob"
+    },
+    {
+      "key": "maxActiveJobs",
+      "value": "3"
+    },
+    {
+      "key": "pollIntervalMs",
+      "value": "3000"
+    },
+    {
+      "key": "maxPolls",
+      "value": "60"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health",
+      "description": "Liveness/readiness. `200` with `ok` (or `degraded` when Redis is down), `503` when MongoDB is down.",
+      "item": [
+        {
+          "name": "Health check",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Overall status is ok or degraded', () => {",
+                  "    pm.expect(body.status).to.be.oneOf(['ok', 'degraded']);",
+                  "});",
+                  "pm.test('MongoDB is ok', () => pm.expect(body.mongo).to.eql('ok'));",
+                  "pm.test('Redis is reported', () => pm.expect(body.redis).to.be.oneOf(['ok', 'unavailable']));",
+                  "pm.test('Status is degraded exactly when Redis is down', () => {",
+                  "    pm.expect(body.status === 'degraded').to.eql(body.redis === 'unavailable');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Checks MongoDB and Redis.\n\n- `200` `{\"status\": \"ok\"}`: everything is up\n- `200` `{\"status\": \"degraded\"}`: Redis is down; the API still works and falls back to MongoDB\n- `503` `{\"status\": \"unavailable\"}`: MongoDB is down"
+          },
+          "response": [
+            {
+              "name": "Healthy",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/health",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["health"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\",\n  \"mongo\": \"ok\",\n  \"redis\": \"ok\"\n}"
+            },
+            {
+              "name": "Redis down",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/health",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["health"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"degraded\",\n  \"mongo\": \"ok\",\n  \"redis\": \"unavailable\"\n}"
+            },
+            {
+              "name": "MongoDB down",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/health",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["health"]
+                }
+              },
+              "status": "Service Unavailable",
+              "code": 503,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"unavailable\",\n  \"mongo\": \"unavailable\",\n  \"redis\": \"ok\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Request id is echoed back",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('X-Request-ID is echoed unchanged', () => {",
+                  "    pm.expect(pm.response.headers.get('X-Request-ID')).to.eql('postman-trace-123');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Request-ID",
+                "value": "postman-trace-123"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "A well-formed `X-Request-ID` (`[A-Za-z0-9._-]{1,64}`) is kept and returned, so a request can be traced across services and in the logs."
+          }
+        },
+        {
+          "name": "Invalid request id is replaced",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Server generated a fresh request id', () => {",
+                  "    const id = pm.response.headers.get('X-Request-ID');",
+                  "    pm.expect(id).to.not.eql('not a valid id!');",
+                  "    pm.expect(id).to.match(/^[0-9a-f]{32}$/);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Request-ID",
+                "value": "not a valid id!"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "An `X-Request-ID` that doesn't match `[A-Za-z0-9._-]{1,64}` is discarded and the server generates its own (32 hex chars)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Document lifecycle",
+      "description": "The main flow: submit a document, poll it until the worker finishes, submit the same content again\n(returns the same document), send it as another user (served from the summary cache), then list\nthe user's documents.\n\nRun this folder in order (Collection Runner or `postman collection run`). Requests pass ids\nto each other through collection variables (`documentId`, `docContent`, ...).\n\nProcessing is mocked: 10\u201330 s per attempt, ~10% of attempts fail, up to 3 attempts with backoff.\n**Poll until finished** loops on itself (every `pollIntervalMs`, at most `maxPolls` times) when run\nin the Runner/CLI. Sent by hand, it just shows the current status; click Send again to re-poll.",
+      "item": [
+        {
+          "name": "Submit document",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Unique content per run, so this is never a cache hit and always queues a real job.",
+                  "const runId = pm.variables.replaceIn('{{$guid}}');",
+                  "pm.collectionVariables.set('docContent',",
+                  "    'Revenue grew 12% in Q3. Costs stayed flat. Headcount rose by 4. Run ' + runId + '.');",
+                  "pm.collectionVariables.set('pollCount', 0);",
+                  "pm.collectionVariables.unset('documentId');",
+                  "pm.collectionVariables.unset('finalStatus');",
+                  "pm.collectionVariables.unset('finalSummary');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('Returns a 24-char hex document_id', () => {",
+                  "    pm.expect(body.document_id).to.match(/^[0-9a-f]{24}$/);",
+                  "});",
+                  "pm.test('New content is queued: only document_id and status', () => {",
+                  "    pm.expect(body.status).to.eql('queued');",
+                  "    pm.expect(body).to.have.all.keys('document_id', 'status');",
+                  "});",
+                  "pm.test('Location header points at the new document', () => {",
+                  "    pm.expect(pm.response.headers.get('Location')).to.eql('/documents/' + body.document_id);",
+                  "});",
+                  "pm.collectionVariables.set('documentId', body.document_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "Submits a document for summarization. Returns `201` with the new `document_id` and a\n`Location: /documents/{id}` header.\n\n- `{document_id, status: queued}` for new content: poll `GET /documents/{id}` for the result.\n- The whole document, `status: completed` with `summary` set, when identical content was\n  summarized before (cache hit).\n- `200` with the user's existing document when they already sent this content, unless it `failed`.\n\nThe pre-request script makes the content unique per run so this always starts a real job.\n`422` on invalid input, `429` when the user already has `MAX_ACTIVE_JOBS_PER_USER` jobs in flight.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Q3 report\",\n  \"content\": \"{{docContent}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "name": "Queued",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/documents",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Q3 report\",\n  \"content\": \"{{docContent}}\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                },
+                {
+                  "key": "Location",
+                  "value": "/documents/6ac7a26fb52c99a11550b084"
+                }
+              ],
+              "body": "{\n  \"document_id\": \"6ac7a26fb52c99a11550b084\",\n  \"status\": \"queued\"\n}"
+            },
+            {
+              "name": "Served from cache",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/documents",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Q3 report\",\n  \"content\": \"{{docContent}}\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                },
+                {
+                  "key": "Location",
+                  "value": "/documents/6ac7a2a1b52c99a11550b085"
+                }
+              ],
+              "body": "{\n  \"document_id\": \"6ac7a2a1b52c99a11550b085\",\n  \"user_id\": \"alice\",\n  \"title\": \"Q3 report\",\n  \"content\": \"Revenue grew 12% in Q3. Costs stayed flat.\",\n  \"status\": \"completed\",\n  \"summary\": {\n    \"text\": \"Revenue grew 12% in Q3. Costs stayed flat.\",\n    \"keywords\": [\n      \"revenue\",\n      \"grew\",\n      \"costs\",\n      \"stayed\",\n      \"flat\"\n    ],\n    \"word_count\": 8,\n    \"reading_time_seconds\": 2,\n    \"model\": \"mock-summarizer-v1\"\n  },\n  \"error\": null,\n  \"attempts\": 0,\n  \"cache_hit\": true,\n  \"created_at\": \"2026-10-08T14:03:05.117000Z\",\n  \"updated_at\": \"2026-10-08T14:03:05.117000Z\",\n  \"completed_at\": \"2026-10-08T14:03:05.117000Z\"\n}"
+            },
+            {
+              "name": "Too many active jobs",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/documents",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Q3 report\",\n  \"content\": \"{{docContent}}\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "status": "Too Many Requests",
+              "code": 429,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"You already have 3 documents queued or processing. Wait for one to finish and try again.\"\n}"
+            },
+            {
+              "name": "Missing fields",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/documents",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Q3 report\",\n  \"content\": \"{{docContent}}\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "status": "Unprocessable Entity",
+              "code": 422,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": [\n    {\n      \"type\": \"missing\",\n      \"loc\": [\n        \"body\",\n        \"title\"\n      ],\n      \"msg\": \"Field required\",\n      \"input\": {\n        \"user_id\": \"alice\"\n      }\n    },\n    {\n      \"type\": \"missing\",\n      \"loc\": [\n        \"body\",\n        \"content\"\n      ],\n      \"msg\": \"Field required\",\n      \"input\": {\n        \"user_id\": \"alice\"\n      }\n    }\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get document",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const doc = pm.response.json();",
+                  "pm.test('Returns the document that was just submitted', () => {",
+                  "    pm.expect(doc.document_id).to.eql(pm.collectionVariables.get('documentId'));",
+                  "});",
+                  "if (['queued', 'processing'].includes(doc.status)) {",
+                  "    pm.test('In progress: only document_id and status', () => {",
+                  "        pm.expect(doc).to.have.all.keys('document_id', 'status');",
+                  "    });",
+                  "} else {",
+                  "    // only if the worker is configured to finish within a few milliseconds",
+                  "    pm.test('Finished: the whole document', () => {",
+                  "        pm.expect(doc).to.have.all.keys(['document_id', 'user_id', 'title', 'content', 'status', 'summary', 'error',",
+                  "    'attempts', 'cache_hit', 'created_at', 'updated_at', 'completed_at']);",
+                  "        pm.expect(doc.user_id).to.eql(pm.variables.get('userId'));",
+                  "        pm.expect(doc.title).to.eql('Q3 report');",
+                  "    });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents/{{documentId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents", "{{documentId}}"]
+            },
+            "description": "Polls a document.\n\n- While it's `queued` or `processing`: only `document_id` and `status`.\n- Once it's `completed` or `failed`: the whole document, including `content`, with `summary`\n  set when completed or `error` when failed.\n\n`404` for an unknown or malformed id."
+          },
+          "response": [
+            {
+              "name": "In progress",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/documents/{{documentId}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents", "{{documentId}}"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"document_id\": \"6ac7a26fb52c99a11550b084\",\n  \"status\": \"processing\"\n}"
+            },
+            {
+              "name": "Completed",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/documents/{{documentId}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents", "{{documentId}}"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"document_id\": \"6ac7a26fb52c99a11550b084\",\n  \"user_id\": \"alice\",\n  \"title\": \"Q3 report\",\n  \"content\": \"Revenue grew 12% in Q3. Costs stayed flat.\",\n  \"status\": \"completed\",\n  \"summary\": {\n    \"text\": \"Revenue grew 12% in Q3. Costs stayed flat.\",\n    \"keywords\": [\n      \"revenue\",\n      \"grew\",\n      \"costs\",\n      \"stayed\",\n      \"flat\"\n    ],\n    \"word_count\": 8,\n    \"reading_time_seconds\": 2,\n    \"model\": \"mock-summarizer-v1\"\n  },\n  \"error\": null,\n  \"attempts\": 1,\n  \"cache_hit\": false,\n  \"created_at\": \"2026-10-08T14:02:23.312000Z\",\n  \"updated_at\": \"2026-10-08T14:02:41.208000Z\",\n  \"completed_at\": \"2026-10-08T14:02:41.208000Z\"\n}"
+            },
+            {
+              "name": "Not found",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/documents/{{documentId}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents", "{{documentId}}"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Document not found\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Poll until finished",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Wait between polls (not before the first one).",
+                  "if (Number(pm.collectionVariables.get('pollCount') || 0) > 0) {",
+                  "    const delay = Number(pm.variables.get('pollIntervalMs') || 3000);",
+                  "    setTimeout(() => {}, delay);",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const doc = pm.response.json();",
+                  "const polls = Number(pm.collectionVariables.get('pollCount') || 0) + 1;",
+                  "const maxPolls = Number(pm.variables.get('maxPolls') || 60);",
+                  "pm.collectionVariables.set('pollCount', polls);",
+                  "const inProgress = ['queued', 'processing'].includes(doc.status);",
+                  "",
+                  "if (inProgress && polls < maxPolls) {",
+                  "    pm.test('In progress: only document_id and status', () => {",
+                  "        pm.expect(doc).to.have.all.keys('document_id', 'status');",
+                  "    });",
+                  "    console.log(`poll ${polls}: ${doc.status}`);",
+                  "    pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "    pm.collectionVariables.set('finalStatus', doc.status);",
+                  "    pm.test(`Document finished within ${maxPolls} polls`, () => {",
+                  "        pm.expect(doc.status).to.be.oneOf(['completed', 'failed']);",
+                  "    });",
+                  "    (inProgress ? pm.test.skip : pm.test)('Finished: the whole document', () => {",
+                  "        pm.expect(doc).to.have.all.keys(['document_id', 'user_id', 'title', 'content', 'status', 'summary', 'error',",
+                  "    'attempts', 'cache_hit', 'created_at', 'updated_at', 'completed_at']);",
+                  "        pm.expect(doc.document_id).to.eql(pm.collectionVariables.get('documentId'));",
+                  "        pm.expect(doc.user_id).to.eql(pm.variables.get('userId'));",
+                  "        pm.expect(doc.title).to.eql('Q3 report');",
+                  "        pm.expect(doc.content).to.eql(pm.collectionVariables.get('docContent'));",
+                  "        pm.expect(doc.attempts).to.be.a('number').and.at.least(1);",
+                  "        pm.expect(doc.cache_hit).to.eql(false);",
+                  "        pm.expect(doc.completed_at).to.be.a('string');",
+                  "    });",
+                  "    if (doc.status === 'completed') {",
+                  "        pm.collectionVariables.set('finalSummary', JSON.stringify(doc.summary));",
+                  "        pm.test('Completed document has a summary and no error', () => {",
+                  "            pm.expect(doc.error).to.eql(null);",
+                  "            pm.expect(doc.summary).to.include.keys('text', 'keywords', 'word_count', 'reading_time_seconds', 'model');",
+                  "            pm.expect(doc.summary.keywords).to.be.an('array');",
+                  "            pm.expect(doc.summary.word_count).to.be.above(0);",
+                  "        });",
+                  "    } else if (doc.status === 'failed') {",
+                  "        // The mock fails ~10% of attempts; failing all retries is rare but legitimate.",
+                  "        pm.test('Failed document carries an error and no summary', () => {",
+                  "            pm.expect(doc.error).to.be.a('string').that.is.not.empty;",
+                  "            pm.expect(doc.summary).to.eql(null);",
+                  "        });",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents/{{documentId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents", "{{documentId}}"]
+            },
+            "description": "Same endpoint as **Get document**, but in the Runner/CLI it re-runs itself every `pollIntervalMs`\nuntil the document is `completed` or `failed` (or `maxPolls` is reached), then checks the result.\nEvery in-progress response is checked to carry only `document_id` and `status`, and the final one\nto be the whole document."
+          }
+        },
+        {
+          "name": "Resubmit same content (same document)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const finalStatus = pm.collectionVariables.get('finalStatus');",
+                  "const sameDocTest = finalStatus !== 'failed' ? pm.test : pm.test.skip;",
+                  "sameDocTest('Status is 200 OK, nothing new was created', () => pm.response.to.have.status(200));",
+                  "sameDocTest('Returns the original document', () => {",
+                  "    pm.expect(body.document_id).to.eql(pm.collectionVariables.get('documentId'));",
+                  "    pm.expect(pm.response.headers.get('Location')).to.eql('/documents/' + body.document_id);",
+                  "});",
+                  "(finalStatus === 'completed' ? pm.test : pm.test.skip)('The whole original document, with its summary and title', () => {",
+                  "    pm.expect(body.status).to.eql('completed');",
+                  "    pm.expect(body.summary).to.eql(JSON.parse(pm.collectionVariables.get('finalSummary')));",
+                  "    pm.expect(body.title).to.eql('Q3 report');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "Sending content this user already sent returns their existing document instead of creating another:\n`200` with the same `document_id` and `Location`, in the same shape as **Get document** (the whole\ndocument once it's finished).\nThe new title is ignored.\n\nA `failed` document doesn't block a fresh try, so resubmitting it creates a new one (`201`).\nTests are skipped in that case.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Q3 report (again)\",\n  \"content\": \"{{docContent}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Same content, another user (cache hit)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('cachedDocumentId', body.document_id);",
+                  "const wasCompleted = pm.collectionVariables.get('finalStatus') === 'completed';",
+                  "const cacheTest = wasCompleted ? pm.test : pm.test.skip;",
+                  "cacheTest('Completed immediately from the cache: the whole document', () => {",
+                  "    pm.expect(body.status).to.eql('completed');",
+                  "    pm.expect(body).to.have.all.keys(['document_id', 'user_id', 'title', 'content', 'status', 'summary', 'error',",
+                  "    'attempts', 'cache_hit', 'created_at', 'updated_at', 'completed_at']);",
+                  "    pm.expect(body.cache_hit).to.eql(true);",
+                  "    pm.expect(body.user_id).to.eql(pm.variables.get('otherUserId'));",
+                  "    pm.expect(body.content).to.eql(pm.collectionVariables.get('docContent'));",
+                  "});",
+                  "cacheTest('Summary matches the original document', () => {",
+                  "    pm.expect(body.summary).to.eql(JSON.parse(pm.collectionVariables.get('finalSummary')));",
+                  "});",
+                  "cacheTest('Is a new document, not the original', () => {",
+                  "    pm.expect(body.document_id).to.not.eql(pm.collectionVariables.get('documentId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "Another user sending content that was already summarized gets a document of their own, completed\nstraight from the cache: `201` with the whole document, `status: completed` and the summary set. Cache hits don't count\nagainst the per-user active-job limit.\n\nTests are skipped if the original document ended up `failed` (nothing to cache).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{otherUserId}}\",\n  \"title\": \"Q3 report\",\n  \"content\": \"{{docContent}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get cached document",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const doc = pm.response.json();",
+                  "pm.test('Returns the cache hit document', () => {",
+                  "    pm.expect(doc.document_id).to.eql(pm.collectionVariables.get('cachedDocumentId'));",
+                  "});",
+                  "const wasCompleted = pm.collectionVariables.get('finalStatus') === 'completed';",
+                  "(wasCompleted ? pm.test : pm.test.skip)('The whole document, flagged as a cache hit with 0 attempts', () => {",
+                  "    pm.expect(doc).to.have.all.keys(['document_id', 'user_id', 'title', 'content', 'status', 'summary', 'error',",
+                  "    'attempts', 'cache_hit', 'created_at', 'updated_at', 'completed_at']);",
+                  "    pm.expect(doc.status).to.eql('completed');",
+                  "    pm.expect(doc.cache_hit).to.eql(true);",
+                  "    pm.expect(doc.attempts).to.eql(0);",
+                  "    pm.expect(doc.user_id).to.eql(pm.variables.get('otherUserId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents/{{cachedDocumentId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents", "{{cachedDocumentId}}"]
+            },
+            "description": "The other user's document from the cache hit is stored like any other, flagged with `cache_hit: true`."
+          }
+        },
+        {
+          "name": "List user documents",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has pagination fields', () => {",
+                  "    pm.expect(body.page).to.eql(1);",
+                  "    pm.expect(body.page_size).to.eql(20);",
+                  "    pm.expect(body.total).to.be.a('number').and.at.least(body.items.length);",
+                  "});",
+                  "pm.test('Items leave out the document text', () => {",
+                  "    body.items.forEach(d => pm.expect(d).to.not.have.property('content'));",
+                  "});",
+                  "pm.test('All items belong to the user', () => {",
+                  "    body.items.forEach(d => pm.expect(d.user_id).to.eql(pm.variables.get('userId')));",
+                  "});",
+                  "pm.test('Contains the document submitted in this run', () => {",
+                  "    const ids = body.items.map(d => d.document_id);",
+                  "    pm.expect(ids).to.include(pm.collectionVariables.get('documentId'));",
+                  "    // the cache hit belongs to otherUserId",
+                  "    pm.expect(ids).to.not.include(pm.collectionVariables.get('cachedDocumentId'));",
+                  "});",
+                  "pm.test('Sorted newest first', () => {",
+                  "    const created = body.items.map(d => d.created_at);",
+                  "    pm.expect(created).to.eql([...created].sort().reverse());",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/{{userId}}/documents?page=1&page_size=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "{{userId}}", "documents"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "1-based page number"
+                },
+                {
+                  "key": "page_size",
+                  "value": "20",
+                  "description": "1\u2013100, default 20"
+                }
+              ]
+            },
+            "description": "Paginated list of a user's documents, newest first. An unknown user returns an empty list, not a 404."
+          },
+          "response": [
+            {
+              "name": "Page of documents",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/users/{{userId}}/documents?page=1&page_size=20",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["users", "{{userId}}", "documents"],
+                  "query": [
+                    {
+                      "key": "page",
+                      "value": "1",
+                      "description": "1-based page number"
+                    },
+                    {
+                      "key": "page_size",
+                      "value": "20",
+                      "description": "1\u2013100, default 20"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"items\": [\n    {\n      \"document_id\": \"6ac7a26fb52c99a11550b084\",\n      \"user_id\": \"alice\",\n      \"title\": \"Q3 report\",\n      \"status\": \"completed\",\n      \"summary\": {\n        \"text\": \"Revenue grew 12% in Q3. Costs stayed flat.\",\n        \"keywords\": [\n          \"revenue\",\n          \"grew\",\n          \"costs\",\n          \"stayed\",\n          \"flat\"\n        ],\n        \"word_count\": 8,\n        \"reading_time_seconds\": 2,\n        \"model\": \"mock-summarizer-v1\"\n      },\n      \"error\": null,\n      \"attempts\": 1,\n      \"cache_hit\": false,\n      \"created_at\": \"2026-10-08T14:02:23.312000Z\",\n      \"updated_at\": \"2026-10-08T14:02:41.208000Z\",\n      \"completed_at\": \"2026-10-08T14:02:41.208000Z\"\n    }\n  ],\n  \"page\": 1,\n  \"page_size\": 20,\n  \"total\": 1\n}"
+            }
+          ]
+        },
+        {
+          "name": "List user documents (status=completed)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Only completed documents are returned', () => {",
+                  "    body.items.forEach(d => pm.expect(d.status).to.eql('completed'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/{{userId}}/documents?page=1&page_size=20&status=completed",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "{{userId}}", "documents"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "1-based page number"
+                },
+                {
+                  "key": "page_size",
+                  "value": "20",
+                  "description": "1\u2013100, default 20"
+                },
+                {
+                  "key": "status",
+                  "value": "completed",
+                  "description": "queued | processing | completed | failed"
+                }
+              ]
+            },
+            "description": "Filter by status: `queued`, `processing`, `completed` or `failed`."
+          }
+        },
+        {
+          "name": "List user documents (page_size=1)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('At most one item on the page', () => pm.expect(body.items.length).to.be.at.most(1));",
+                  "pm.test('Total still counts everything (this run added at least 1)', () => {",
+                  "    pm.expect(body.total).to.be.at.least(1);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/{{userId}}/documents?page=1&page_size=1",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "{{userId}}", "documents"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "1-based page number"
+                },
+                {
+                  "key": "page_size",
+                  "value": "1",
+                  "description": "1\u2013100, default 20"
+                }
+              ]
+            },
+            "description": "`total` counts all matching documents regardless of page size."
+          }
+        },
+        {
+          "name": "List documents of unknown user",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Empty page', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.items).to.eql([]);",
+                  "    pm.expect(body.total).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/nobody-{{$timestamp}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "nobody-{{$timestamp}}", "documents"]
+            },
+            "description": "There is no users collection, so a user with no documents is an empty page rather than a 404."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Validation & errors",
+      "description": "Negative cases. None of these create documents.",
+      "item": [
+        {
+          "name": "Submit with missing fields",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for title').to.include('title');",
+                  "    pm.expect(locs, 'error for content').to.include('content');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "`title` and `content` are required.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{userId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit with unknown field",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for priority').to.include('priority');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "Unknown fields are rejected (`extra=forbid`), so typos don't pass silently.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Q3 report\",\n  \"content\": \"Some text\",\n  \"priority\": \"high\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit with blank title",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for title').to.include('title');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "Strings are trimmed before the length checks, so whitespace-only values are rejected.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"   \",\n  \"content\": \"Some text\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit with invalid user_id",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for user_id').to.include('user_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "`user_id` must match `^[A-Za-z0-9_.-]+$`, 1\u201364 chars.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"alice smith\",\n  \"title\": \"Q3 report\",\n  \"content\": \"Some text\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit with content over 100,000 chars",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.variables.set('longContent', 'a'.repeat(100001));"]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for content').to.include('content');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "`content` is capped at 100,000 characters. The pre-request script builds a 100,001-char string.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{userId}}\",\n  \"title\": \"Too long\",\n  \"content\": \"{{longContent}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit malformed JSON",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "A body that isn't valid JSON is a `422` with `type: json_invalid`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"user_id\": \"{{userId}}\", \"title\":",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Get document with malformed id",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 404 Not Found', () => pm.response.to.have.status(404));",
+                  "pm.test('Body says the document was not found', () => {",
+                  "    pm.expect(pm.response.json()).to.eql({ detail: 'Document not found' });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents/not-a-valid-id",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents", "not-a-valid-id"]
+            },
+            "description": "A malformed id is a `404` too: from the client's point of view there is no document there either way."
+          }
+        },
+        {
+          "name": "Get document that doesn't exist",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 404 Not Found', () => pm.response.to.have.status(404));",
+                  "pm.test('Body says the document was not found', () => {",
+                  "    pm.expect(pm.response.json()).to.eql({ detail: 'Document not found' });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents/ffffffffffffffffffffffff",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents", "ffffffffffffffffffffffff"]
+            },
+            "description": "Well-formed but unknown id."
+          }
+        },
+        {
+          "name": "List with page_size over 100",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for page_size').to.include('page_size');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/{{userId}}/documents?page_size=101",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "{{userId}}", "documents"],
+              "query": [
+                {
+                  "key": "page_size",
+                  "value": "101",
+                  "description": "max is 100"
+                }
+              ]
+            },
+            "description": "`page_size` must be between 1 and 100."
+          }
+        },
+        {
+          "name": "List with page 0",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for page').to.include('page');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/{{userId}}/documents?page=0",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "{{userId}}", "documents"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "0",
+                  "description": "pages start at 1"
+                }
+              ]
+            },
+            "description": "`page` is 1-based."
+          }
+        },
+        {
+          "name": "List with unknown status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for status').to.include('status');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/{{userId}}/documents?status=archived",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "{{userId}}", "documents"],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "archived",
+                  "description": "not a valid status"
+                }
+              ]
+            },
+            "description": "`status` must be one of `queued`, `processing`, `completed`, `failed`."
+          }
+        },
+        {
+          "name": "List with invalid user_id",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+                  "pm.test('Body is a FastAPI validation error', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.detail).to.be.an('array').that.is.not.empty;",
+                  "    body.detail.forEach(e => pm.expect(e).to.include.keys('type', 'loc', 'msg'));",
+                  "});",
+                  "pm.test('Error points at the offending field(s)', () => {",
+                  "    const locs = pm.response.json().detail.map(e => e.loc[e.loc.length - 1]);",
+                  "    pm.expect(locs, 'error for user_id').to.include('user_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/alice%20smith/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["users", "alice%20smith", "documents"]
+            },
+            "description": "The path `user_id` follows the same rules as in the request body."
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Rate limit",
+      "description": "Each user can have at most `MAX_ACTIVE_JOBS_PER_USER` (default 3) documents `queued` or `processing`.\nThe next submission gets `429` until one finishes.\n\nUses a fresh throwaway user per run (`rlUserId`) so it doesn't interfere with `userId`. Set the\n`maxActiveJobs` variable if you changed `MAX_ACTIVE_JOBS_PER_USER`.\n\nSide effect: leaves `maxActiveJobs` real jobs in the queue; the worker finishes them within a minute or so.",
+      "item": [
+        {
+          "name": "Submit up to the limit",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// First submission of the scenario: pick a fresh user.",
+                  "if (!pm.collectionVariables.get('rlUserId')) {",
+                  "    pm.collectionVariables.set('rlUserId', 'ratelimit-' + Date.now());",
+                  "    pm.collectionVariables.set('rlCount', 0);",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 201 Created', () => pm.response.to.have.status(201));",
+                  "pm.test('Job is queued', () => pm.expect(pm.response.json().status).to.eql('queued'));",
+                  "const count = Number(pm.collectionVariables.get('rlCount') || 0) + 1;",
+                  "pm.collectionVariables.set('rlCount', count);",
+                  "if (count < Number(pm.variables.get('maxActiveJobs') || 3)) {",
+                  "    pm.execution.setNextRequest(pm.info.requestName);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "Submits `maxActiveJobs` documents (each with unique content, so none are cache hits).\nIn the Runner/CLI it repeats itself until the limit is reached; sent by hand, click Send\n`maxActiveJobs` times.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{rlUserId}}\",\n  \"title\": \"Rate limit probe\",\n  \"content\": \"Rate limit probe {{$guid}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit over the limit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 429 Too Many Requests', () => pm.response.to.have.status(429));",
+                  "pm.test('Explains the limit', () => {",
+                  "    const limit = pm.variables.get('maxActiveJobs') || 3;",
+                  "    pm.expect(pm.response.json().detail).to.include(`You already have ${limit} documents queued or processing`);",
+                  "});",
+                  "// Reset so the next run starts with a fresh user.",
+                  "pm.collectionVariables.unset('rlUserId');",
+                  "pm.collectionVariables.unset('rlCount');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": ["{{baseUrl}}"],
+              "path": ["documents"]
+            },
+            "description": "One more than the limit: `429 Too Many Requests`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{rlUserId}}\",\n  \"title\": \"One too many\",\n  \"content\": \"Rate limit probe {{$guid}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "name": "Too many active jobs",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/documents",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["documents"]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"user_id\": \"{{rlUserId}}\",\n  \"title\": \"One too many\",\n  \"content\": \"Rate limit probe {{$guid}}\"\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "status": "Too Many Requests",
+              "code": 429,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"You already have 3 documents queued or processing. Wait for one to finish and try again.\"\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

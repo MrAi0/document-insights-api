@@ -39,7 +39,7 @@ API_PORT=8080 REDIS_PORT=6380 docker compose up       # if 8000 / 6379 are alrea
 docker compose run --rm tests
 ```
 
-Or run them locally with `pip install -r requirements-dev.txt && docker compose up -d mongo redis && pytest`. There are 58 tests: unit tests, plus integration tests using pytest + `httpx.AsyncClient` against real MongoDB and Redis.
+Or run them locally with `pip install -r requirements-dev.txt && docker compose up -d mongo redis && pytest`. There are 70 tests: unit tests, plus integration tests using pytest + `httpx.AsyncClient` against real MongoDB and Redis.
 
 **Without Docker** (Python 3.11+, with Mongo and Redis from compose):
 
@@ -78,19 +78,28 @@ All settings are environment variables, optionally set in a `.env` file. `.env.e
 | Endpoint | Description | Status codes |
 |---|---|---|
 | `POST /documents` | Submit `user_id`, `title`, `content` | 201, 200 already submitted (returns that document), 422 invalid input, 429 limit reached |
-| `GET /documents/{id}` | Status, plus the summary once completed | 200, 404 |
+| `GET /documents/{id}` | Poll a document | 200, 404 |
 | `GET /users/{user_id}/documents` | Paginated list, newest first. `page`, `page_size` (max 100), optional `status` | 200, 422 |
 | `GET /health` | Checks MongoDB and Redis | 200 `ok` or `degraded` (Redis down), 503 (Mongo down) |
 
-Any endpoint returns 503 while MongoDB is unreachable.
+Any endpoint returns 503 while MongoDB is unreachable. Errors are JSON, `{"detail": "..."}`, except 422, which has FastAPI's list of validation errors. An unexpected error is a 500 with only `"Internal server error"` in the body; its traceback is logged under the response's `X-Request-ID`.
 
-A document goes `queued → processing → completed | failed`. A completed document looks like this:
+A document goes `queued → processing → completed | failed`. `GET /documents/{id}` and `POST /documents` return it in one of two shapes, depending on `status`:
+
+While it's `queued` or `processing`, only what a client needs to decide whether to poll again:
+
+```json
+{ "document_id": "6ac7a26fb52c99a11550b084", "status": "processing" }
+```
+
+Once it's `completed` or `failed`, the whole document. `summary` is set when it completed, `error` when it failed:
 
 ```json
 {
   "document_id": "6ac7a26fb52c99a11550b084",
   "user_id": "alice",
   "title": "Q3 report",
+  "content": "Revenue grew 12% in Q3. Costs stayed flat.",
   "status": "completed",
   "summary": {
     "text": "Revenue grew 12% in Q3. Costs stayed flat.",
@@ -108,13 +117,16 @@ A document goes `queued → processing → completed | failed`. A completed docu
 }
 ```
 
+The OpenAPI spec (`/docs`) documents this as a `oneOf` with `status` as the discriminator, so generated clients get both types.
+
 ## Project structure
 
-The code is split into controllers, services and repositories:
+The code is split into routes, controllers, services and repositories:
 
 ```
 app/
-  controllers/      routes (documents, users, health). HTTP only
+  routes/           which URL and method go to which controller, plus status codes and docs
+  controllers/      request handlers: call a service, shape the HTTP response
   services/         business logic, plus the MongoDB and Redis connection singletons
   repositories/     all MongoDB queries
   middleware/       request id + access logging, exception -> status code mapping
@@ -128,7 +140,7 @@ tests/
 postman/            Postman collection + local environment
 ```
 
-Controllers call services, and services call repositories or Redis. Services don't know about HTTP: they raise exceptions (e.g. `TooManyActiveJobs`) that the middleware turns into status codes, so the worker reuses the same services as the API. MongoDB and Redis clients are created once per process (`services/mongo_service.py`, `services/redis_service.py`), connected on startup and closed on shutdown.
+A request goes routes → controllers → services → repositories. Each routes module creates an `APIRouter` and registers controller functions on it with `router.add_api_route(...)`, which is what FastAPI's `@router.get(...)` decorator does under the hood. Keeping that in `routes/` means the URL map is in one place and controllers are plain async functions. Their parameters still declare what they need (the request body, path and query parameters, services through `Depends`), and FastAPI resolves those wherever the function is defined. Services don't know about HTTP: they raise exceptions (e.g. `TooManyActiveJobs`) that the middleware turns into status codes, so the worker reuses the same services as the API. MongoDB and Redis clients are created once per process (`services/mongo_service.py`, `services/redis_service.py`), connected on startup and closed on shutdown.
 
 ## How it works
 
@@ -159,8 +171,9 @@ For each job: claim it atomically → check the cache → summarize → save the
 - **The cache has two layers.** Redis keeps summaries for 24h, keyed by content hash. On a Redis miss, MongoDB is checked for any earlier completed document with the same hash. If one exists, its summary is reused and put back in Redis, so text that has been summarized once is never processed again. The cache is shared across users, since the summary depends only on the content.
 - **Duplicate submissions:** a user sending text they already sent gets their existing document back (`200`, same `document_id`) instead of a new one. A unique index on `user_id + content_hash` (ignoring `failed` documents, so those can be retried) makes this hold even for two identical requests at the same moment. Different users sending the same text each get their own document, served from the cache. If they arrive at the same time, a short lock on the content hash makes one job wait for the other's result instead of summarizing it again.
 - **Redis down:** the API keeps working. The cache and rate limit read MongoDB instead, workers poll, and `/health` reports `degraded`. With **Mongo down** the API returns 503 and workers retry until it's back.
+- **Polling returns as little as possible until there's something to return.** A client polls every few seconds for 10–30 seconds, and until the job is finished every response would be the same. So while a document is queued or processing, the response is just `document_id` and `status`. Once it's finished, the whole document, including the text. `POST` follows the same rule, so a cache hit comes back as the whole document straight away.
 - **Fast reads.** Every read is a direct index lookup: `content_hash` for finding an earlier summary, `user_id + content_hash` for a user's earlier submission, `user_id + created_at` and `user_id + status + created_at` for listing, `status + visible_at` for claiming jobs. With 100,000 documents, each read took under 1.5 ms (p95). `tests/test_indexes.py` checks MongoDB's query plans, so a missing index or a full collection scan fails the tests.
-- **Production basics:** JSON logs with a request id on every line, config validated at startup, graceful worker shutdown (a job in progress is put back in the queue), and the API and worker containers run as a non-root user.
+- **Production basics:** JSON logs with a request id on every line, unexpected errors returned as a JSON 500 (and logged with their traceback and request id), config validated at startup, graceful worker shutdown (a job in progress is put back in the queue), and the API and worker containers run as a non-root user.
 
 ## Assumptions
 
@@ -168,6 +181,7 @@ For each job: claim it atomically → check the cache → summarize → save the
 - The 10% failure rate is per attempt. With 3 attempts, about 0.1% of documents end up `failed`. Set `MAX_ATTEMPTS=1` to see failures more often.
 - "Identical content" means the same text after trimming whitespace.
 - A malformed document id returns 404, the same as an unknown one.
+- "Processed" means finished either way: a `failed` document is returned in full too, since the client needs its `error`. The full document includes `content`. The list endpoint leaves it out, since a page of documents could be several MB.
 
 ## What I'd do with more time
 

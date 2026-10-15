@@ -14,7 +14,7 @@ from app.utils.clock import utcnow
 
 logger = logging.getLogger(__name__)
 
-# list endpoints never need the full text
+# the list endpoint never returns the full text
 _WITHOUT_CONTENT = {"content": 0}
 
 # A user has at most one document per content in these statuses. Failed ones
@@ -123,7 +123,7 @@ class DocumentRepository:
         return doc
 
     async def get(self, document_id: ObjectId) -> dict[str, Any] | None:
-        return await self._collection.find_one({"_id": document_id}, _WITHOUT_CONTENT)
+        return await self._collection.find_one({"_id": document_id})
 
     async def find_submitted(self, user_id: str, content_hash: str) -> dict[str, Any] | None:
         """The user's earlier document with the same content, unless it failed.
@@ -131,8 +131,7 @@ class DocumentRepository:
         A single lookup on the user_content index. tests/test_indexes.py checks the plan.
         """
         return await self._collection.find_one(
-            {"user_id": user_id, "content_hash": content_hash, "status": {"$in": _NOT_FAILED}},
-            _WITHOUT_CONTENT,
+            {"user_id": user_id, "content_hash": content_hash, "status": {"$in": _NOT_FAILED}}
         )
 
     async def list_for_user(

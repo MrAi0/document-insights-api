@@ -1,43 +1,38 @@
-from fastapi import APIRouter, HTTPException, Response, status
+"""Handlers for /documents. The URLs that lead here are in app/routes/document_routes.py."""
+
+from fastapi import HTTPException, Response, status
 
 from app.dependencies import DocumentServiceDep
-from app.models import DocumentCreate, DocumentOut, DocumentSubmitted
-
-router = APIRouter(prefix="/documents", tags=["documents"])
-
-
-@router.post(
-    "",
-    status_code=status.HTTP_201_CREATED,
-    responses={
-        status.HTTP_200_OK: {
-            "model": DocumentSubmitted,
-            "description": "The user already submitted this content. Returns that document "
-            "instead of creating another",
-        },
-        status.HTTP_429_TOO_MANY_REQUESTS: {
-            "description": "The user already has the maximum number of documents in progress"
-        },
-    },
+from app.models import (
+    Document,
+    DocumentCreate,
+    DocumentDetail,
+    DocumentInProgress,
+    DocumentResponse,
 )
+
+
 async def submit_document(
     payload: DocumentCreate, response: Response, service: DocumentServiceDep
-) -> DocumentSubmitted:
+) -> DocumentResponse:
     doc, created = await service.submit(payload)
     if not created:
         response.status_code = status.HTTP_200_OK
     response.headers["Location"] = f"/documents/{doc.document_id}"
-    return DocumentSubmitted(document_id=doc.document_id, status=doc.status, summary=doc.summary)
+    return _to_response(doc)
 
 
-@router.get(
-    "/{document_id}",
-    responses={status.HTTP_404_NOT_FOUND: {"description": "Document not found"}},
-)
-async def get_document(document_id: str, service: DocumentServiceDep) -> DocumentOut:
+async def get_document(document_id: str, service: DocumentServiceDep) -> DocumentResponse:
     # A malformed id is a 404 as well. From the client's point of view there's
     # no document there either way.
     doc = await service.get(document_id)
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Document not found")
-    return doc
+    return _to_response(doc)
+
+
+def _to_response(doc: Document) -> DocumentInProgress | DocumentDetail:
+    # Same rule for submitting and polling, so a client handles one shape either way.
+    if doc.is_finished:
+        return DocumentDetail.model_validate(doc.model_dump())
+    return DocumentInProgress(document_id=doc.document_id, status=doc.status)

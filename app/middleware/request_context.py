@@ -5,7 +5,8 @@ import uuid
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 from app.utils.logger import request_id_var
 
@@ -30,7 +31,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         started = time.perf_counter()
         status_code = 500
         try:
-            response = await call_next(request)
+            response = await self._call_app(request, call_next)
             status_code = response.status_code
             response.headers["X-Request-ID"] = request_id
             return response
@@ -49,3 +50,20 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 },
             )
             request_id_var.reset(token)
+
+    @staticmethod
+    async def _call_app(request: Request, call_next: RequestResponseEndpoint) -> Response:
+        try:
+            return await call_next(request)
+        except Exception:
+            # Errors we expect already have handlers (middleware/exception_handlers.py),
+            # so anything that gets here is a bug. It's handled here rather than with
+            # an Exception handler because by the time that runs, this middleware has
+            # finished: the log line would have no request id and the response no
+            # X-Request-ID. The client gets JSON like every other error, not
+            # Starlette's plain-text 500, and never the exception's details.
+            logger.exception("unhandled error")
+            return JSONResponse(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"detail": "Internal server error"},
+            )

@@ -11,20 +11,54 @@ async def test_submit_document_is_queued(client, submit, redis):
 
     assert resp.status_code == 201
     body = resp.json()
-    assert body["status"] == "queued"
-    assert body["summary"] is None
+    # nothing to show yet but the status
+    assert body == {"document_id": body["document_id"], "status": "queued"}
     assert resp.headers["location"] == f"/documents/{body['document_id']}"
     assert resp.headers["x-request-id"]
 
     resp = await client.get(f"/documents/{body['document_id']}")
     assert resp.status_code == 200
-    doc = resp.json()
-    assert doc["status"] == "queued"
-    assert doc["user_id"] == "alice"
-    assert doc["attempts"] == 0
-    assert "content" not in doc
+    assert resp.json() == body
     # and a sleeping worker has been told about it
     assert await redis.lrange("jobs:wakeup", 0, -1) == [body["document_id"]]
+
+
+async def test_finished_document_is_returned_in_full(client, submit, processor):
+    content = "Revenue grew 12% in Q3. Costs stayed flat. Headcount rose by 4."
+    document_id = (await submit(content=content, title="Q3 report")).json()["document_id"]
+    await processor.run_once()
+
+    resp = await client.get(f"/documents/{document_id}")
+
+    assert resp.status_code == 200
+    doc = resp.json()
+    assert doc["document_id"] == document_id
+    assert doc["status"] == "completed"
+    assert doc["user_id"] == "alice"
+    assert doc["title"] == "Q3 report"
+    assert doc["content"] == content
+    assert doc["summary"]["text"] == "Revenue grew 12% in Q3. Costs stayed flat."
+    assert doc["error"] is None
+    assert doc["attempts"] == 1
+    assert doc["cache_hit"] is False
+    assert doc["completed_at"] is not None
+    # the worker's bookkeeping stays internal
+    assert not {"_id", "content_hash", "lease_token", "visible_at"} & doc.keys()
+
+
+@pytest.mark.parametrize("settings_overrides", [{"failure_rate": 1, "max_attempts": 1}])
+async def test_failed_document_is_returned_in_full_with_the_error(client, submit, processor):
+    content = "Never gets summarized."
+    document_id = (await submit(content=content)).json()["document_id"]
+    await processor.run_once()
+
+    doc = (await client.get(f"/documents/{document_id}")).json()
+
+    assert doc["status"] == "failed"
+    assert doc["content"] == content
+    assert doc["summary"] is None
+    assert "simulated" in doc["error"]
+    assert doc["completed_at"] is not None
 
 
 async def test_submit_rejects_invalid_payload(client):
@@ -65,10 +99,13 @@ async def test_duplicate_content_is_served_from_cache(client, submit, processor,
 
     assert resp.status_code == 201
     body = resp.json()
+    # finished straight away, so it's the whole document
     assert body["status"] == "completed"
     assert body["summary"] == original["summary"]
-    doc = (await client.get(f"/documents/{body['document_id']}")).json()
-    assert doc["cache_hit"] is True
+    assert body["cache_hit"] is True
+    assert body["user_id"] == "bob"
+    assert body["content"] == content
+    assert (await client.get(f"/documents/{body['document_id']}")).json() == body
     # nothing to process, so no worker gets woken for it
     assert await redis.lrange("jobs:wakeup", 0, -1) == [first["document_id"]]
 

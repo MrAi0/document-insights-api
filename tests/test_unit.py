@@ -2,14 +2,21 @@
 
 import random
 
+import httpx
 import pytest
+from bson import ObjectId
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.controllers import document_controller, health_controller, user_controller
+from app.dependencies import get_document_service
+from app.main import create_app
 from app.models import DocumentCreate
+from app.routes import document_routes, health_routes, user_routes
 from app.services.mongo_service import MongoService
 from app.services.redis_service import RedisService
 from app.services.summarizer_service import SummarizationError, SummarizerService, build_summary
+from app.utils.clock import utcnow
 from app.utils.hashing import hash_content
 from app.utils.ids import parse_object_id
 
@@ -106,3 +113,71 @@ def test_connection_singletons_complain_if_used_before_connect():
         _ = MongoService().db
     with pytest.raises(RuntimeError, match="not connected"):
         _ = RedisService().client
+
+
+def make_app():
+    # Never started, so it doesn't connect to anything. Fine for anything that
+    # doesn't reach Mongo or Redis.
+    return create_app(Settings(_env_file=None, log_json=False))
+
+
+def test_every_route_goes_to_a_controller():
+    routes = {
+        (method, route.path): route.endpoint
+        for module in (document_routes, user_routes, health_routes)
+        for route in module.router.routes
+        for method in route.methods
+    }
+
+    assert routes == {
+        ("POST", "/documents"): document_controller.submit_document,
+        ("GET", "/documents/{document_id}"): document_controller.get_document,
+        ("GET", "/users/{user_id}/documents"): user_controller.list_user_documents,
+        ("GET", "/health"): health_controller.health,
+    }
+    # and the app serves exactly these
+    served = make_app().openapi()["paths"]
+    assert {(method.upper(), path) for path, ops in served.items() for method in ops} == set(routes)
+
+
+def test_openapi_documents_both_document_shapes():
+    paths = make_app().openapi()["paths"]
+
+    def schema(path, method, code):
+        return paths[path][method]["responses"][code]["content"]["application/json"]["schema"]
+
+    polled = schema("/documents/{document_id}", "get", "200")
+    assert polled["discriminator"]["mapping"] == {
+        "queued": "#/components/schemas/DocumentInProgress",
+        "processing": "#/components/schemas/DocumentInProgress",
+        "completed": "#/components/schemas/DocumentDetail",
+        "failed": "#/components/schemas/DocumentDetail",
+    }
+    # submitting returns the same thing, whether it's new (201) or a resubmission (200)
+    assert schema("/documents", "post", "201")["oneOf"] == polled["oneOf"]
+    assert schema("/documents", "post", "200")["oneOf"] == polled["oneOf"]
+
+
+async def test_unexpected_error_is_a_json_500_with_the_request_id(capsys):
+    class BrokenService:
+        async def get(self, document_id: str):
+            raise RuntimeError("nobody saw this coming")
+
+    app = make_app()
+    app.dependency_overrides[get_document_service] = BrokenService
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/documents/{ObjectId()}", headers={"X-Request-ID": "req-123"})
+
+    assert resp.status_code == 500
+    # JSON like every other error, without the exception's details
+    assert resp.json() == {"detail": "Internal server error"}
+    assert resp.headers["x-request-id"] == "req-123"
+    # the traceback is logged instead, tagged with the request id
+    logged = capsys.readouterr().out
+    assert "unhandled error request_id=req-123" in logged
+    assert "RuntimeError: nobody saw this coming" in logged
+
+
+def test_utcnow_has_mongo_precision():
+    assert utcnow().microsecond % 1000 == 0

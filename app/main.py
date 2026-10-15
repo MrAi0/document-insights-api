@@ -5,10 +5,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.config import Settings, get_settings
-from app.controllers import api_router
 from app.middleware.exception_handlers import register_exception_handlers
 from app.middleware.request_context import RequestContextMiddleware
 from app.repositories.document_repository import DocumentRepository
+from app.routes import api_router
 from app.services.mongo_service import mongo_service
 from app.services.redis_service import redis_service
 from app.utils.logger import setup_logging

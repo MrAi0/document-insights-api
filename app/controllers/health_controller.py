@@ -1,15 +1,11 @@
-from fastapi import APIRouter, Response, status
+"""Handler for /health. The URL that leads here is in app/routes/health_routes.py."""
+
+from fastapi import Response, status
 
 from app.dependencies import HealthServiceDep
 from app.models import HealthOut
 
-router = APIRouter(tags=["health"])
 
-
-@router.get(
-    "/health",
-    responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "MongoDB is unreachable"}},
-)
 async def health(response: Response, service: HealthServiceDep) -> HealthOut:
     result = await service.check()
     # 503 only when Mongo is down, so a load balancer pulls the instance out.

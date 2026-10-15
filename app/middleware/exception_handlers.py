@@ -9,7 +9,8 @@ from app.services.document_service import TooManyActiveJobs
 logger = logging.getLogger(__name__)
 
 # Services raise plain exceptions and don't know about HTTP. This is where
-# those exceptions get turned into status codes.
+# those exceptions get turned into status codes. Anything unexpected becomes a
+# 500 in middleware/request_context.py.
 
 
 async def too_many_active_jobs(request: Request, exc: TooManyActiveJobs) -> JSONResponse:
