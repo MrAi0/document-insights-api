@@ -1,8 +1,8 @@
 """Every URL the API serves.
 
-A routes module says which URL and method go to which controller function, plus
-what OpenAPI needs (status codes, summaries). The controllers in app/controllers
-handle the request. main.py mounts `api_router`.
+Each routes module declares its endpoints with what OpenAPI needs (status codes,
+summaries) and handles the request by calling a service. main.py mounts
+`api_router`.
 """
 
 from fastapi import APIRouter

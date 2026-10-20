@@ -8,7 +8,6 @@ from bson import ObjectId
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.controllers import document_controller, health_controller, user_controller
 from app.dependencies import get_document_service
 from app.main import create_app
 from app.models import DocumentCreate
@@ -121,7 +120,7 @@ def make_app():
     return create_app(Settings(_env_file=None, log_json=False))
 
 
-def test_every_route_goes_to_a_controller():
+def test_every_route_goes_to_its_handler():
     routes = {
         (method, route.path): route.endpoint
         for module in (document_routes, user_routes, health_routes)
@@ -130,10 +129,10 @@ def test_every_route_goes_to_a_controller():
     }
 
     assert routes == {
-        ("POST", "/documents"): document_controller.submit_document,
-        ("GET", "/documents/{document_id}"): document_controller.get_document,
-        ("GET", "/users/{user_id}/documents"): user_controller.list_user_documents,
-        ("GET", "/health"): health_controller.health,
+        ("POST", "/documents"): document_routes.submit_document,
+        ("GET", "/documents/{document_id}"): document_routes.get_document,
+        ("GET", "/users/{user_id}/documents"): user_routes.list_user_documents,
+        ("GET", "/health"): health_routes.health,
     }
     # and the app serves exactly these
     served = make_app().openapi()["paths"]

@@ -121,12 +121,12 @@ The OpenAPI spec (`/docs`) documents this as a `oneOf` with `status` as the disc
 
 ## Project structure
 
-The code is split into routes, controllers, services and repositories:
+The code is split into routes, services and repositories:
 
 ```
 app/
-  routes/           which URL and method go to which controller, plus status codes and docs
-  controllers/      request handlers: call a service, shape the HTTP response
+  routes/           endpoints: URL, method, status codes and docs, plus the handler that
+                    calls a service and shapes the HTTP response
   services/         business logic, plus the MongoDB and Redis connection singletons
   repositories/     all MongoDB queries
   middleware/       request id + access logging, exception -> status code mapping
@@ -140,7 +140,7 @@ tests/
 postman/            Postman collection + local environment
 ```
 
-A request goes routes → controllers → services → repositories. Each routes module creates an `APIRouter` and registers controller functions on it with `router.add_api_route(...)`, which is what FastAPI's `@router.get(...)` decorator does under the hood. Keeping that in `routes/` means the URL map is in one place and controllers are plain async functions. Their parameters still declare what they need (the request body, path and query parameters, services through `Depends`), and FastAPI resolves those wherever the function is defined. Services don't know about HTTP: they raise exceptions (e.g. `TooManyActiveJobs`) that the middleware turns into status codes, so the worker reuses the same services as the API. MongoDB and Redis clients are created once per process (`services/mongo_service.py`, `services/redis_service.py`), connected on startup and closed on shutdown.
+A request goes routes → services → repositories. Each routes module creates an `APIRouter` and declares its endpoints with `@router.get(...)` / `@router.post(...)`. A handler's parameters declare what it needs (the request body, path and query parameters, services through `Depends`), and its body stays thin: call a service, then set the status code or headers. Services don't know about HTTP: they raise exceptions (e.g. `TooManyActiveJobs`) that the middleware turns into status codes, so the worker reuses the same services as the API. MongoDB and Redis clients are created once per process (`services/mongo_service.py`, `services/redis_service.py`), connected on startup and closed on shutdown.
 
 ## How it works
 
